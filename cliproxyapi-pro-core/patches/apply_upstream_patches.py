@@ -201,6 +201,8 @@ if customization_sentinel.exists():
 new_customization_paths = (
     'internal/pro',
     'internal/api/handlers/management/account_inspection_host.go',
+    'internal/api/handlers/management/auth_file_connection.go',
+    'internal/api/handlers/management/auth_file_connection_test.go',
     *[
         f'internal/api/handlers/management/{name}'
         for name in ACCOUNT_INSPECTION_SOURCE_FILES
@@ -232,6 +234,7 @@ new_customization_paths = (
     'sdk/cliproxy/auth/auth_runtime_state.go',
     'sdk/cliproxy/auth/auth_runtime_state_test.go',
     'sdk/cliproxy/auth/inspection_refresh.go',
+    'sdk/cliproxy/auth/pinned_execution.go',
     'sdk/cliproxy/pro_features_service_test.go',
 )
 for relative_path in new_customization_paths:
@@ -1095,6 +1098,8 @@ write(plugin_quota_management_test, read_text(Path(__file__).resolve().parent / 
 
 for source_name, target_name in (
     ('account_inspection_host.go', 'account_inspection_host.go'),
+    ('auth_file_connection.go', 'auth_file_connection.go'),
+    ('auth_file_connection_test.go', 'auth_file_connection_test.go'),
     ('pro_auth_mutation.go', 'pro_auth_mutation.go'),
     ('pro_management_runtime.go', 'pro_management_runtime.go'),
 ):
@@ -1251,6 +1256,7 @@ type generateContextKey struct{}
 type attemptTrackerContextKey struct{}
 type attemptIndexContextKey struct{}
 type generateContextKey struct{}
+type skipMonitoringContextKey struct{}
 
 type attemptTracker struct {
 \tmu   sync.Mutex
@@ -1331,6 +1337,32 @@ func AttemptIndexFromContext(ctx context.Context) (int64, bool) {
 
 ''',
     'func WithAttemptTracking(ctx context.Context) context.Context',
+)
+insert_before(
+    usage_manager,
+    '// Plugin consumes usage records emitted by the proxy runtime.\n',
+    '''// WithSkipMonitoring marks an internal diagnostic request whose usage must
+// not be persisted by the request-monitoring sink. Other usage consumers still
+// receive the record so this flag does not change executor or auth semantics.
+func WithSkipMonitoring(ctx context.Context) context.Context {
+\tif ctx == nil {
+\t\tctx = context.Background()
+\t}
+\treturn context.WithValue(ctx, skipMonitoringContextKey{}, true)
+}
+
+// SkipMonitoringFromContext reports whether request-monitoring persistence
+// should ignore usage emitted from ctx.
+func SkipMonitoringFromContext(ctx context.Context) bool {
+\tif ctx == nil {
+\t\treturn false
+\t}
+\tskip, _ := ctx.Value(skipMonitoringContextKey{}).(bool)
+\treturn skip
+}
+
+''',
+    'func WithSkipMonitoring(ctx context.Context)',
 )
 replace_once(
     usage_manager,
@@ -2339,6 +2371,21 @@ elif 'requestmeta.' not in redisqueue_plugin_text:
     raise SystemExit(f'request metadata calls not found in {redisqueue_plugin}')
 replace_once(
     redisqueue_plugin,
+    '''\tif p == nil {
+\t\treturn
+\t}
+''',
+    '''\tif p == nil {
+\t\treturn
+\t}
+\tif coreusage.SkipMonitoringFromContext(ctx) {
+\t\treturn
+\t}
+''',
+    'coreusage.SkipMonitoringFromContext(ctx)',
+)
+replace_once(
+    redisqueue_plugin,
     '\trequestID := strings.TrimSpace(requestmeta.GetRequestID(ctx))\n\treasoningEffort :=',
     '\trequestID := strings.TrimSpace(requestmeta.GetRequestID(ctx))\n\tstream := coreusage.StreamFromContext(ctx)\n\treasoningEffort :=',
     'stream := coreusage.StreamFromContext(ctx)',
@@ -2395,6 +2442,43 @@ if redisqueue_plugin_test.exists():
     )
     text = text.replace('internallogging.', 'requestmeta.')
     write(redisqueue_plugin_test, text)
+    insert_before(
+        redisqueue_plugin_test,
+        'func TestUsageQueuePluginNormalizesDirectSDKUsageByProvider(t *testing.T) {\n',
+        '''func TestUsageQueuePluginSkipsMonitoringContext(t *testing.T) {
+\twithEnabledQueue(t, func() {
+\t\tctx := coreusage.WithSkipMonitoring(context.Background())
+\t\t(&usageQueuePlugin{}).HandleUsage(ctx, coreusage.Record{
+\t\t\tProvider: "codex",
+\t\t\tModel:    "gpt-test",
+\t\t\tDetail:   coreusage.Detail{InputTokens: 1, TotalTokens: 1},
+\t\t})
+\t\tif items := PopOldest(10); len(items) != 0 {
+\t\t\tt.Fatalf("PopOldest() items = %d, want 0 for skipped monitoring", len(items))
+\t\t}
+\t})
+}
+
+''',
+        'func TestUsageQueuePluginSkipsMonitoringContext',
+    )
+
+usage_manager_test = ROOT / 'sdk/cliproxy/usage/manager_test.go'
+insert_before(
+    usage_manager_test,
+    'func TestRecordOmittedGenerateIsEnabled(t *testing.T) {\n',
+    '''func TestSkipMonitoringContext(t *testing.T) {
+\tif SkipMonitoringFromContext(context.Background()) {
+\t\tt.Fatal("SkipMonitoringFromContext(background) = true, want false")
+\t}
+\tif !SkipMonitoringFromContext(WithSkipMonitoring(context.Background())) {
+\t\tt.Fatal("SkipMonitoringFromContext(marked) = false, want true")
+\t}
+}
+
+''',
+    'func TestSkipMonitoringContext',
+)
 
 queue_go_source('internal/requestmeta/client.go')
 
@@ -2435,7 +2519,54 @@ replace_once(
 replace_once(
     server_management,
     '''\t\tmgmt.POST("/api-call", s.mgmt.APICall)\n''',
-    '''\t\tmgmt.POST("/api-call", s.mgmt.APICall)\n\t\ts.mgmt.RegisterPluginQuotaRoutes(mgmt)\n\t\ts.mgmt.RegisterAccountInspectionRoutes(mgmt)\n\t\ts.mgmt.RegisterRoutingPolicyRoutes(mgmt)\n\t\ts.mgmt.RegisterProFeatureRoutes(mgmt)\n''',
+	'''\t\tmgmt.POST("/api-call", s.mgmt.APICall)\n\t\tmgmt.POST("/auth-files/test", s.mgmt.TestAuthFileConnection)\n\t\ts.mgmt.RegisterPluginQuotaRoutes(mgmt)\n\t\ts.mgmt.RegisterAccountInspectionRoutes(mgmt)\n\t\ts.mgmt.RegisterRoutingPolicyRoutes(mgmt)\n\t\ts.mgmt.RegisterProFeatureRoutes(mgmt)\n''',
+)
+
+auth_files_handler = ROOT / 'internal/api/handlers/management/auth_files.go'
+replace_once(
+    auth_files_handler,
+    '''\t// Try to find auth ID via authManager
+\tvar authID string
+\tif h.authManager != nil {
+\t\tauths := h.authManager.List()
+\t\tfor _, auth := range auths {
+\t\t\tif auth.FileName == name || auth.ID == name {
+\t\t\t\tauthID = auth.ID
+\t\t\t\tbreak
+\t\t\t}
+\t\t}
+\t}
+''',
+    '''\t// Try to find the exact auth record via authManager. Disabled auths are
+\t// intentionally absent from the upstream model registry, but their provider
+\t// metadata is still needed for the static model fallback below.
+\tvar authID string
+\tvar selectedAuth *coreauth.Auth
+\tif h.authManager != nil {
+\t\tauths := h.authManager.List()
+\t\tfor _, auth := range auths {
+\t\t\tif auth.FileName == name || auth.ID == name {
+\t\t\t\tauthID = auth.ID
+\t\t\t\tselectedAuth = auth
+\t\t\t\tbreak
+\t\t\t}
+\t\t}
+\t}
+''',
+)
+replace_once(
+    auth_files_handler,
+    '''\tmodels := reg.GetModelsForClient(authID)
+
+\tresult := make([]gin.H, 0, len(models))
+''',
+    '''\tmodels := reg.GetModelsForClient(authID)
+\tif len(models) == 0 && selectedAuth != nil {
+\t\tmodels = authFileManagementFallbackModels(selectedAuth)
+\t}
+
+\tresult := make([]gin.H, 0, len(models))
+''',
 )
 
 handler = ROOT / 'internal/api/handlers/management/handler.go'
@@ -2615,6 +2746,7 @@ insert_before_nth(
 )
 
 queue_go_source('sdk/cliproxy/auth/inspection_refresh.go')
+queue_go_source('sdk/cliproxy/auth/pinned_execution.go')
 
 auth_types = ROOT / 'sdk/cliproxy/auth/types.go'
 replace_once(
@@ -3261,6 +3393,8 @@ subprocess.run([
         for name in ACCOUNT_INSPECTION_SOURCE_FILES
     ],
     'internal/api/handlers/management/account_inspection_host.go',
+    'internal/api/handlers/management/auth_file_connection.go',
+    'internal/api/handlers/management/auth_file_connection_test.go',
     'internal/api/handlers/management/auth_files_fields.go',
     'internal/api/handlers/management/auth_files.go',
     'internal/api/handlers/management/handler.go',
@@ -3404,6 +3538,7 @@ subprocess.run([
     'sdk/auth/filestore_test.go',
     'sdk/cliproxy/auth/auth_runtime_state.go',
     'sdk/cliproxy/auth/auth_runtime_state_test.go',
+    'sdk/cliproxy/auth/pinned_execution.go',
     'sdk/cliproxy/auth/conductor.go',
     'sdk/cliproxy/auth/scheduler.go',
     'sdk/cliproxy/auth/types.go',

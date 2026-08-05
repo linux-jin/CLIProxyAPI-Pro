@@ -48,7 +48,7 @@ internal/embeddedusage
 - `GET /v0/management/usage/stream` — usage 实时更新 SSE 流。
 - `GET /v0/management/usage/export` — JSONL/NDJSON 导出。
 - `POST /v0/management/usage/import` — JSONL/NDJSON 导入。
-- `POST /v0/management/usage/reset` — 原子清空请求事件和派生统计，保留监控设置、模型价格、配额缓存和备份。
+- `POST /v0/management/usage/reset` — 在独占运行态屏障内清空请求事件、派生统计和账号调度/成功/失败计数；保留路由轮询游标、监控设置、模型价格、配额缓存和备份。
 - `GET /v0/management/usage/status` — 服务状态和记录数量。
 - `GET /v0/management/usage/quota-cache` — 读取配额缓存或统计信息。
 - `PUT /v0/management/usage/quota-cache` — 写入配额缓存。
@@ -136,6 +136,12 @@ detail 还会保留 upstream `ClientRequestMetadata` 提供的 `client_ip`、`x_
 套餐信息的 last-known-good 保留。当前 Gemini CLI 插件无需修改：Core 会通过插件已有的
 `Executor.HttpRequest` 提供兼容适配；插件未来原生实现协议后会自动优先使用原生能力。
 协议字段与兼容策略见 [QUOTA_PROVIDER.md](QUOTA_PROVIDER.md)。
+
+### 认证文件连接测试
+
+- `POST /v0/management/auth-files/test` — 传入 `name`、可选的 `auth_index` 和 `model`，将一次最小 OpenAI Chat 格式的真实文本生成请求固定到该认证记录。
+
+Pro 扩展了上游 `GET /v0/management/auth-files/models`：优先使用该认证记录已注册的模型；上游因账号禁用而注销模型时，改用对应提供商的静态模型定义，Codex 会按账号套餐选择目录。因此模型查看和连接测试可以共用同一个接口。测试沿用 upstream 执行器的请求翻译、账号代理、401 刷新、模型别名和结果统计路径，但不会写入请求监控。诊断执行会绕过正常调度的 disabled、cooldown 和 unavailable 可用性门槛，因此可验证异常账号是否已经恢复；结果不会清除用户设置的 `disabled` 开关。响应包含 `success`、`model`、`latency_ms`、模型 `output`，或 `error`、`error_code`、`http_status`。
 
 ### 内建代理池与 OAuth 套餐模型策略
 
