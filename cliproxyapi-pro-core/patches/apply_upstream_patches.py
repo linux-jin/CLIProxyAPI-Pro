@@ -1974,6 +1974,126 @@ replace_once(
 ''',
 )
 
+replace_once(
+    ROOT / 'internal/pluginhost/host_callbacks.go',
+    '''\tstreamCtx, cancel := context.WithCancel(ctx)
+\tresp, errDo := h.newHTTPClient(nil).DoStream(streamCtx, httpReq)
+\tif errDo != nil {
+\t\tcancel()
+\t\treturn nil, errDo
+\t}
+\tstreamID := ""
+\tif h != nil && h.httpStreams != nil {
+\t\tstreamID = h.httpStreams.open(resp.Chunks, cancel)
+\t}
+\tif streamID == "" {
+\t\tcancel()
+\t\treturn nil, fmt.Errorf("host http stream bridge is unavailable")
+\t}
+\treturn marshalRPCResult(rpcHostHTTPStreamResponse{
+\t\tStatusCode: resp.StatusCode,
+\t\tHeaders:    httpHeader(resp.Headers),
+\t\tStreamID:   streamID,
+\t})
+''',
+    '''\tstreamCtx, cancel := context.WithCancel(ctx)
+\tcancelOwned := true
+\tdefer func() {
+\t\tif cancelOwned {
+\t\t\tcancel()
+\t\t}
+\t}()
+\tresp, errDo := h.newHTTPClient(nil).DoStream(streamCtx, httpReq)
+\tif errDo != nil {
+\t\treturn nil, errDo
+\t}
+\tstreamID := ""
+\tif h != nil && h.httpStreams != nil {
+\t\tstreamID = h.httpStreams.open(resp.Chunks, cancel)
+\t}
+\tif streamID == "" {
+\t\treturn nil, fmt.Errorf("host http stream bridge is unavailable")
+\t}
+\trawResponse, errMarshal := marshalRPCResult(rpcHostHTTPStreamResponse{
+\t\tStatusCode: resp.StatusCode,
+\t\tHeaders:    httpHeader(resp.Headers),
+\t\tStreamID:   streamID,
+\t})
+\tif errMarshal != nil {
+\t\th.httpStreams.close(streamID)
+\t\treturn nil, errMarshal
+\t}
+\tcancelOwned = false
+\treturn rawResponse, nil
+''',
+    'rawResponse, errMarshal := marshalRPCResult(rpcHostHTTPStreamResponse{',
+)
+
+replace_once(
+    ROOT / 'internal/pluginhost/host_model_stream_callbacks.go',
+    '''\tstreamCtx, cancel := context.WithCancel(context.WithoutCancel(callbackCtx))
+\tstream, errMsg := executor.ExecuteModelStream(streamCtx, modelExecutionRequestFromPlugin(req.HostModelExecutionRequest, skipPluginID))
+\tif errMsg != nil {
+\t\tcancel()
+\t\treturn nil, modelExecutionError(errMsg)
+\t}
+\tstreamID := ""
+\tif h.modelStreams != nil {
+\t\tstreamID = h.modelStreams.open(req.HostCallbackID, stream.Chunks, cancel)
+\t}
+\tif streamID == "" {
+\t\tcancel()
+\t\treturn nil, fmt.Errorf("host model stream bridge is unavailable")
+\t}
+\tif req.HostCallbackID != "" {
+\t\th.addCallbackCleanup(req.HostCallbackID, func() {
+\t\t\th.modelStreams.close(streamID)
+\t\t})
+\t}
+\treturn marshalRPCResult(pluginapi.HostModelStreamResponse{
+\t\tStatusCode: stream.StatusCode,
+\t\tHeaders:    cloneHeader(stream.Headers),
+\t\tStreamID:   streamID,
+\t})
+''',
+    '''\tstreamCtx, cancel := context.WithCancel(context.WithoutCancel(callbackCtx))
+\tcancelOwned := true
+\tdefer func() {
+\t\tif cancelOwned {
+\t\t\tcancel()
+\t\t}
+\t}()
+\tstream, errMsg := executor.ExecuteModelStream(streamCtx, modelExecutionRequestFromPlugin(req.HostModelExecutionRequest, skipPluginID))
+\tif errMsg != nil {
+\t\treturn nil, modelExecutionError(errMsg)
+\t}
+\tstreamID := ""
+\tif h.modelStreams != nil {
+\t\tstreamID = h.modelStreams.open(req.HostCallbackID, stream.Chunks, cancel)
+\t}
+\tif streamID == "" {
+\t\treturn nil, fmt.Errorf("host model stream bridge is unavailable")
+\t}
+\tif req.HostCallbackID != "" {
+\t\th.addCallbackCleanup(req.HostCallbackID, func() {
+\t\t\th.modelStreams.close(streamID)
+\t\t})
+\t}
+\trawResponse, errMarshal := marshalRPCResult(pluginapi.HostModelStreamResponse{
+\t\tStatusCode: stream.StatusCode,
+\t\tHeaders:    cloneHeader(stream.Headers),
+\t\tStreamID:   streamID,
+\t})
+\tif errMarshal != nil {
+\t\th.modelStreams.close(streamID)
+\t\treturn nil, errMarshal
+\t}
+\tcancelOwned = false
+\treturn rawResponse, nil
+''',
+    'rawResponse, errMarshal := marshalRPCResult(pluginapi.HostModelStreamResponse{',
+)
+
 queue_go_source('internal/pluginstore/autoinstall.go')
 
 queue_go_source('internal/pluginstore/autoinstall_test.go')
@@ -3091,6 +3211,26 @@ replace_once(
 ''',
     'm.mu.RUnlock()\n\t\t\t\tauth, exec, providerKey, err := m.pickNextMixedLegacy',
 )
+
+# The normal Execute/ExecuteCount/ExecuteStream path always selects through
+# pickNextMixed. Keep this scoped to that function so the fast scheduler return
+# cannot be confused with the structurally similar pickNextMixedLegacy return.
+auth_conductor_text = read(auth_conductor)
+mixed_start = auth_conductor_text.find('func (m *Manager) pickNextMixed(')
+if mixed_start < 0:
+    raise SystemExit(f'function not found in {auth_conductor}: pickNextMixed')
+mixed_text = auth_conductor_text[mixed_start:]
+mixed_return = '\treturn authCopy, executor, providerKey, nil\n}'
+mixed_recorded_return = '\tm.recordAuthSelected(authCopy.ID)\n' + mixed_return
+if mixed_recorded_return not in mixed_text:
+    if mixed_text.count(mixed_return) != 1:
+        raise SystemExit(
+            f'expected one fast mixed return in {auth_conductor}, found {mixed_text.count(mixed_return)}'
+        )
+    write(
+        auth_conductor,
+        auth_conductor_text[:mixed_start] + mixed_text.replace(mixed_return, mixed_recorded_return, 1),
+    )
 
 auth_files_handler = ROOT / 'internal/api/handlers/management/auth_files.go'
 auth_files_crud_handler = ROOT / 'internal/api/handlers/management/auth_files_crud.go'
